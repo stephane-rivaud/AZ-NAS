@@ -1,0 +1,322 @@
+"""Bridge from AZ-NAS adapters to ``experimental_grow``'s Hydra dataloaders.
+
+This module never imports anything from the AZ-NAS tree (one-way import
+direction, see the plan). It resolves the sibling ``experimental_grow``
+checkout, composes a Hydra ``dataset_config`` exactly like
+``hydra_script/train_and_grow.py`` does, and returns plain
+``torch.utils.data.DataLoader``/metadata objects that the (separately
+implemented) ``smoke_score.py`` / ``run_score_matrix.py`` scripts consume.
+
+Locked contract (see ``.cursor/plans/az-nas_grow_adapters_0b7a938b.plan.md``):
+
+- Path resolution: ``EXPERIMENTAL_GROW_ROOT`` env var, else sibling of the
+  AZ-NAS repo root (``<AZ-NAS-repo-root>/../experimental_grow``).
+- Always ``get_dataloaders`` with ``transforms="standard"`` for every split
+  (train/val/test) -- never ``create_dataloaders`` / the ``"augmented"``
+  pipeline, so proxy scoring never sees training-time augmentation.
+- Gutenberg is padded from its native ``(1, 27, 18)`` to a square
+  ``(1, 27, 27)`` in the adapter's own transform chain (not in grow's YAML).
+- The first training batch is asserted to be ``BCHW`` float with labels and
+  no NaN/Inf before being handed back to the caller.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from pathlib import Path
+from typing import Any
+
+import torch
+import torch.utils.data
+from omegaconf import DictConfig, OmegaConf
+
+# Gutenberg's native standard-pipeline output is (1, 27, 18). Pad the width
+# dimension only (height is already 27) via torchvision.transforms.Pad's
+# (left, top, right, bottom) order: 18 + 4 + 5 == 27, centered as evenly as
+# an odd remainder allows.
+_GUTENBERG_PAD_LTRB: tuple[int, int, int, int] = (4, 0, 5, 0)
+_GUTENBERG_TARGET_SIZE = 27
+
+
+def _resolve_grow_root() -> Path:
+    """Resolve the ``experimental_grow`` repo root.
+
+    Order: ``EXPERIMENTAL_GROW_ROOT`` env var if set, else the sibling of the
+    AZ-NAS repo root (this file lives at ``<AZ-NAS-root>/adapters/grow_data.py``,
+    so ``parents[1]`` is the AZ-NAS root and ``parents[2]`` is its parent
+    directory, where ``experimental_grow`` is expected to live).
+    """
+    env_root = os.environ.get("EXPERIMENTAL_GROW_ROOT")
+    if env_root:
+        root = Path(env_root).expanduser().resolve()
+    else:
+        root = Path(__file__).resolve().parents[2] / "experimental_grow"
+
+    if not (root / "hydra_script" / "configs").is_dir():
+        raise FileNotFoundError(
+            f"Cannot find an experimental_grow checkout at {root!s} "
+            "(expected hydra_script/configs under it). Set EXPERIMENTAL_GROW_ROOT "
+            "to override the resolved path."
+        )
+    return root
+
+
+def _ensure_grow_on_syspath(grow_root: Path) -> None:
+    """Prepend the grow root to ``sys.path`` so ``hydra_script``/``tools`` import."""
+    root_str = str(grow_root)
+    if root_str not in sys.path:
+        sys.path.insert(0, root_str)
+
+
+def _compose_dataset_cfg(
+    grow_root: Path,
+    dataset_config: str,
+    *,
+    seed: int,
+    num_workers: int,
+) -> DictConfig:
+    """Compose grow's main Hydra config with ``dataset_config`` overridden.
+
+    Uses ``initialize_config_dir`` (a context manager) so ``GlobalHydra`` is
+    cleared on exit and repeated calls (e.g. one per dataset in a batch-sanity
+    loop) don't collide.
+    """
+    from hydra import compose, initialize_config_dir
+
+    config_dir = str(grow_root / "hydra_script" / "configs")
+    overrides = [
+        f"dataset_config={dataset_config}",
+        f"general.seed={seed}",
+        f"general.num_workers={num_workers}",
+    ]
+    with initialize_config_dir(config_dir=config_dir, version_base=None):
+        cfg = compose(config_name="config", overrides=overrides)
+    # compose() locks the tree in struct mode; we need to rewrite
+    # dataset_config.transforms.standard for gutenberg below.
+    OmegaConf.set_struct(cfg, False)
+    return cfg
+
+
+def _apply_gutenberg_pad(dataset_cfg: DictConfig) -> None:
+    """Rewrite the ``standard`` transform pipeline to pad gutenberg to 27x27.
+
+    Locked geometry (plan): gutenberg is native ``(1, 27, 18)``; proxy/search
+    code must only ever see the padded square ``(1, 27, 27)``. This mutates
+    only the composed in-memory config for this run, never the checked-in YAML.
+    """
+    standard = dataset_cfg.transforms.standard
+    transforms_list: list[dict[str, Any]] = OmegaConf.to_container(
+        standard.transforms, resolve=True
+    )  # type: ignore[assignment]
+
+    already_padded = any(
+        t.get("_target_") == "torchvision.transforms.Pad" for t in transforms_list
+    )
+    if not already_padded:
+        transforms_list.append(
+            {
+                "_target_": "torchvision.transforms.Pad",
+                "padding": list(_GUTENBERG_PAD_LTRB),
+            }
+        )
+
+    dataset_cfg.transforms.standard = OmegaConf.create(
+        {"_target_": standard["_target_"], "transforms": transforms_list}
+    )
+
+
+def _build_splits(split_train_val: float) -> dict[str, dict[str, Any]]:
+    """Standard-only train/val/test split descriptors for ``get_dataloaders``.
+
+    Locked: every split uses ``transforms="standard"`` -- proxy scoring never
+    trains on augmented data. ``val`` is omitted when ``split_train_val<=0``
+    (matches ``create_dataloaders``'s own zero-split handling).
+    """
+    splits: dict[str, dict[str, Any]] = {
+        "train": {
+            "source": "train",
+            "proportion": 1.0 - split_train_val if split_train_val > 0 else 1.0,
+            "transforms": "standard",
+            "shuffle": True,
+            "drop_last": True,
+        },
+        "test": {
+            "source": "test",
+            "proportion": 1.0,
+            "transforms": "standard",
+            "shuffle": False,
+            "drop_last": False,
+        },
+    }
+    if split_train_val > 0:
+        splits["val"] = {
+            "source": "train",
+            "proportion": split_train_val,
+            "transforms": "standard",
+            "shuffle": False,
+            "drop_last": False,
+        }
+    return splits
+
+
+def assert_batch_sane(x: torch.Tensor, y: torch.Tensor, *, dataset_name: str) -> None:
+    """Assert a batch is ``BCHW`` float with matching labels and no NaN/Inf.
+
+    Shared by :func:`load` (checked on the train split before returning) and
+    ``batch_sanity.py`` (checked per split/per dataset).
+    """
+    assert isinstance(x, torch.Tensor), (
+        f"{dataset_name}: expected a torch.Tensor batch, got {type(x)!r}"
+    )
+    assert x.ndim == 4, f"{dataset_name}: expected BCHW batch, got shape {tuple(x.shape)}"
+    assert x.dtype.is_floating_point, (
+        f"{dataset_name}: expected a floating-point tensor, got dtype {x.dtype}"
+    )
+    assert y is not None and len(y) == x.shape[0], (
+        f"{dataset_name}: labels missing or batch-size mismatch "
+        f"(inputs={x.shape[0]}, labels={0 if y is None else len(y)})"
+    )
+    assert not torch.isnan(x).any(), f"{dataset_name}: NaN values found in input batch"
+    assert not torch.isinf(x).any(), f"{dataset_name}: Inf values found in input batch"
+
+
+def load(
+    dataset_config: str,
+    *,
+    batch_size: int = 64,
+    seed: int = 0,
+    num_workers: int = 0,
+    device: torch.device | str = "cpu",
+    grow_root: str | os.PathLike[str] | None = None,
+    download: bool | None = None,
+) -> tuple[torch.utils.data.DataLoader, dict[str, Any]]:
+    """Load grow's standard-transform dataloaders for ``dataset_config``.
+
+    Parameters
+    ----------
+    dataset_config
+        Name of a Hydra ``dataset_config`` group entry, e.g. ``"cifar10"``,
+        ``"multnist"``, ``"gutenberg"``.
+    batch_size
+        Shared batch size for all splits.
+    seed
+        Used both for ``general.seed`` (Hydra override, informational) and as
+        the ``get_dataloaders`` split/shuffle seed (reproducible splitting).
+    num_workers
+        DataLoader worker count. Forced to ``0`` on CPU by ``get_dataloaders``
+        regardless of this value.
+    device
+        Target device; only affects ``pin_memory``/``num_workers`` in the
+        returned loaders. Tensors are **not** moved to this device here --
+        callers (e.g. ``smoke_score.py``) are responsible for
+        ``x, y = x.to(device), y.to(device)`` per the plan's
+        ``rand_input=False`` contract.
+    grow_root
+        Override for the resolved ``experimental_grow`` root (mainly for
+        tests); defaults to :func:`_resolve_grow_root`.
+    download
+        If not ``None``, overrides ``dataset_config.dataset.download``.
+        **Caveat:** for the NAS small-benchmark datasets backed by
+        ``tools.datasets.NpyWebDataset`` (multnist, cifartile, geoclassing,
+        gutenberg, chesseract), this flag does not actually gate the initial
+        Figshare fetch -- ``NpyWebDataset.__init__`` always calls
+        ``_download_and_extract()`` regardless of ``download``, and only
+        skips the network request if the zip is already on disk. It only
+        gates torchvision-style datasets (e.g. cifar10) cleanly. Callers
+        that must never touch the network (like ``batch_sanity.py``) check
+        filesystem existence themselves instead of relying on this flag.
+
+    Returns
+    -------
+    tuple[DataLoader, dict]
+        ``(train_loader, meta)``. ``meta`` contains at least ``dataset``,
+        ``num_classes``, ``batch_shape`` (``(C, H, W)``), ``split_train_val``,
+        and ``seed``, plus convenience fields (``val_loader``, ``test_loader``,
+        ``in_channels``, ``input_image_size``, ``image_shape``, ``transforms``)
+        for the not-yet-implemented ``smoke_score.py`` consumer contract.
+    """
+    root = Path(grow_root) if grow_root is not None else _resolve_grow_root()
+    _ensure_grow_on_syspath(root)
+
+    from hydra_script.data_handling.datasets import get_dataloaders
+
+    cfg = _compose_dataset_cfg(root, dataset_config, seed=seed, num_workers=num_workers)
+    dataset_cfg = cfg.dataset_config
+    if download is not None:
+        dataset_cfg.dataset.download = download
+
+    if dataset_cfg.name == "gutenberg":
+        _apply_gutenberg_pad(dataset_cfg)
+
+    split_train_val = float(dataset_cfg.split_train_val)
+    splits = _build_splits(split_train_val)
+    device_t = torch.device(device)
+
+    loaders = get_dataloaders(
+        dataset_cfg,
+        splits=splits,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        device=device_t,
+        seed=seed,
+    )
+
+    train_loader = loaders["train"]
+    batch_x, batch_y = next(iter(train_loader))
+    assert_batch_sane(batch_x, batch_y, dataset_name=dataset_cfg.name)
+
+    num_channels, height, width = (int(d) for d in batch_x.shape[1:])
+    if dataset_cfg.name == "gutenberg":
+        assert (height, width) == (_GUTENBERG_TARGET_SIZE, _GUTENBERG_TARGET_SIZE), (
+            f"gutenberg: expected padded square ({_GUTENBERG_TARGET_SIZE}, "
+            f"{_GUTENBERG_TARGET_SIZE}), got ({height}, {width})"
+        )
+
+    meta: dict[str, Any] = {
+        "dataset": str(dataset_cfg.name),
+        "num_classes": int(dataset_cfg.num_classes),
+        "class_num": int(dataset_cfg.num_classes),
+        "batch_shape": (num_channels, height, width),
+        "split_train_val": split_train_val,
+        "seed": seed,
+        "transforms": "standard",
+        "in_channels": num_channels,
+        "input_image_size": height,
+        "image_shape": (num_channels, height, width),
+        "batch_size": batch_size,
+        "device": str(device_t),
+        "val_loader": loaders.get("val"),
+        "test_loader": loaders.get("test"),
+    }
+    return train_loader, meta
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Ad hoc one-batch check for a single grow dataset_config."
+    )
+    parser.add_argument("--dataset_config", required=True)
+    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--device", default="cpu")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = _parse_args()
+    train_loader, meta = load(
+        args.dataset_config,
+        batch_size=args.batch_size,
+        seed=args.seed,
+        device=args.device,
+    )
+    print(f"dataset={meta['dataset']} num_classes={meta['num_classes']} "
+          f"batch_shape={meta['batch_shape']} split_train_val={meta['split_train_val']}")
+    x, y = next(iter(train_loader))
+    print(f"train batch: x.shape={tuple(x.shape)} x.dtype={x.dtype} y.shape={tuple(y.shape)}")
+
+
+if __name__ == "__main__":
+    main()
