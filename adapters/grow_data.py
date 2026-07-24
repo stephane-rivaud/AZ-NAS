@@ -14,8 +14,23 @@ Locked contract (see ``.cursor/plans/az-nas_grow_adapters_0b7a938b.plan.md``):
 - Always ``get_dataloaders`` with ``transforms="standard"`` for every split
   (train/val/test) -- never ``create_dataloaders`` / the ``"augmented"``
   pipeline, so proxy scoring never sees training-time augmentation.
-- Gutenberg is padded from its native ``(1, 27, 18)`` to a square
-  ``(1, 27, 27)`` in the adapter's own transform chain (not in grow's YAML).
+- Gutenberg and multnist are padded to a square ``32x32`` in the adapter's
+  own transform chain (not in grow's YAML) -- **not** their native shapes
+  (``(1, 27, 18)`` / ``(3, 28, 28)``). This is the AZ-NAS proxy geometry
+  policy (see ``adapters/spaces/README.md``): AZ-NAS's
+  ``compute_az_nas_score`` trainability term relies on
+  ``nn.PixelUnshuffle`` to reconcile mismatched feature-map resolutions
+  between adjacent layers, which requires every stride-2 downsample in the
+  resolution trace to divide evenly (``PixelUnshuffle`` raises on a
+  non-integer/non-divisible ratio). Both datasets' native sizes hit a
+  non-power-of-two spatial size partway through the standard 3x stride-2
+  body (28->14->7->3 and 27->13->6->3, where the last stride hits an odd
+  input), which crashes ``compute_az_nas_score.compute_nas_score`` before
+  it can even measure trainability. Padding to 32x32 (a clean power of two)
+  keeps every stride-2 step exact (32->16->8->4) and makes both datasets
+  score cleanly, matching ``rgb32``'s already-verified geometry. Native
+  shapes on disk are unchanged; only the proxy/search-facing transform
+  pipeline composed here pads them.
 - The first training batch is asserted to be ``BCHW`` float with labels and
   no NaN/Inf before being handed back to the caller.
 """
@@ -32,12 +47,21 @@ import torch
 import torch.utils.data
 from omegaconf import DictConfig, OmegaConf
 
-# Gutenberg's native standard-pipeline output is (1, 27, 18). Pad the width
-# dimension only (height is already 27) via torchvision.transforms.Pad's
-# (left, top, right, bottom) order: 18 + 4 + 5 == 27, centered as evenly as
-# an odd remainder allows.
-_GUTENBERG_PAD_LTRB: tuple[int, int, int, int] = (4, 0, 5, 0)
-_GUTENBERG_TARGET_SIZE = 27
+# AZ-NAS proxy geometry policy (see module docstring): both gutenberg and
+# multnist are padded to a square 32x32 -- not their native shapes -- so
+# every stride-2 downsample AZ-NAS's PixelUnshuffle-based trainability term
+# needs stays evenly divisible. torchvision.transforms.Pad's padding order
+# is (left, top, right, bottom).
+_PAD_TARGET_SIZE = 32
+
+# Gutenberg native standard-pipeline output is (1, 27, 18): width needs
+# +14 (18 -> 32, split 7/7), height needs +5 (27 -> 32, split 2/3 since the
+# remainder is odd).
+_GUTENBERG_PAD_LTRB: tuple[int, int, int, int] = (7, 2, 7, 3)
+
+# Multnist native standard-pipeline output is (3, 28, 28): both dimensions
+# need +4 (28 -> 32), split evenly 2/2.
+_MULTNIST_PAD_LTRB: tuple[int, int, int, int] = (2, 2, 2, 2)
 
 
 def _resolve_grow_root() -> Path:
@@ -99,12 +123,13 @@ def _compose_dataset_cfg(
     return cfg
 
 
-def _apply_gutenberg_pad(dataset_cfg: DictConfig) -> None:
-    """Rewrite the ``standard`` transform pipeline to pad gutenberg to 27x27.
+def _apply_square_pad(dataset_cfg: DictConfig, pad_ltrb: tuple[int, int, int, int]) -> None:
+    """Rewrite the ``standard`` transform pipeline to append a fixed square pad.
 
-    Locked geometry (plan): gutenberg is native ``(1, 27, 18)``; proxy/search
-    code must only ever see the padded square ``(1, 27, 27)``. This mutates
-    only the composed in-memory config for this run, never the checked-in YAML.
+    AZ-NAS proxy geometry policy (see module docstring): gutenberg and
+    multnist must only ever be scored at the padded square 32x32, never
+    their native shapes. This mutates only the composed in-memory config for
+    this run, never the checked-in YAML -- native data on disk is untouched.
     """
     standard = dataset_cfg.transforms.standard
     transforms_list: list[dict[str, Any]] = OmegaConf.to_container(
@@ -118,7 +143,7 @@ def _apply_gutenberg_pad(dataset_cfg: DictConfig) -> None:
         transforms_list.append(
             {
                 "_target_": "torchvision.transforms.Pad",
-                "padding": list(_GUTENBERG_PAD_LTRB),
+                "padding": list(pad_ltrb),
             }
         )
 
@@ -248,7 +273,9 @@ def load(
         dataset_cfg.dataset.download = download
 
     if dataset_cfg.name == "gutenberg":
-        _apply_gutenberg_pad(dataset_cfg)
+        _apply_square_pad(dataset_cfg, _GUTENBERG_PAD_LTRB)
+    elif dataset_cfg.name == "multnist":
+        _apply_square_pad(dataset_cfg, _MULTNIST_PAD_LTRB)
 
     split_train_val = float(dataset_cfg.split_train_val)
     splits = _build_splits(split_train_val)
@@ -268,10 +295,10 @@ def load(
     assert_batch_sane(batch_x, batch_y, dataset_name=dataset_cfg.name)
 
     num_channels, height, width = (int(d) for d in batch_x.shape[1:])
-    if dataset_cfg.name == "gutenberg":
-        assert (height, width) == (_GUTENBERG_TARGET_SIZE, _GUTENBERG_TARGET_SIZE), (
-            f"gutenberg: expected padded square ({_GUTENBERG_TARGET_SIZE}, "
-            f"{_GUTENBERG_TARGET_SIZE}), got ({height}, {width})"
+    if dataset_cfg.name in ("gutenberg", "multnist"):
+        assert (height, width) == (_PAD_TARGET_SIZE, _PAD_TARGET_SIZE), (
+            f"{dataset_cfg.name}: expected padded square ({_PAD_TARGET_SIZE}, "
+            f"{_PAD_TARGET_SIZE}), got ({height}, {width})"
         )
 
     meta: dict[str, Any] = {

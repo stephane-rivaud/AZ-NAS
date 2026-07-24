@@ -13,11 +13,26 @@ dataset X?"*.
 
 | File | Family | Datasets | Native shape | Locked geometry | in_channels |
 |------|--------|----------|---------------|------------------|-------------|
-| `rgb28.py` | `rgb28` | `multnist` | `(3,28,28)` | 28×28 | 3 |
+| `rgb28.py` | `rgb28` | `multnist` | `(3,28,28)` | pad → 32×32 | 3 |
 | `rgb64.py` | `rgb64` | `cifartile`, `geoclassing` | `(3,64,64)` | 64×64 | 3 |
 | `rgb32.py` | `rgb32` | `cifar10`, `cifar100` | `(3,32,32)` | 32×32 | 3 |
-| `gray_sq.py` | `gray_sq` | `gutenberg` | `(1,27,18)` | pad → 27×27 | 1 |
+| `gray_sq.py` | `gray_sq` | `gutenberg` | `(1,27,18)` | pad → 32×32 | 1 |
 | `board12.py` | `board12` | `chesseract` | `(12,8,8)` | 8×8, no stride-2 collapse | 12 |
+
+**AZ-NAS proxy geometry policy (`rgb28`/`gray_sq` pad to 32×32, not their
+native size):** AZ-NAS's `compute_az_nas_score` trainability term uses
+`nn.PixelUnshuffle` to reconcile mismatched feature-map resolutions between
+adjacent layers, which requires every stride-2 downsample in the resolution
+trace to divide evenly (`PixelUnshuffle` raises otherwise). Multnist's
+native `28x28` and gutenberg's native `27x18`/padded-`27x27` both hit a
+non-power-of-two spatial size partway through a standard 3x stride-2 body
+(`28->14->7->3` and `27->13->6->3`), crashing the trainability computation
+before it can even run. Padding both to `32x32` (a clean power of two,
+matching `rgb32`'s already-verified geometry) keeps every stride-2 step
+exact (`32->16->8->4`) and lets both families score cleanly. This padding
+happens only in `grow_data.py`'s in-memory transform pipeline for
+proxy/search purposes -- native data on disk, and the `native_shape` field
+documented above, are unchanged.
 
 Plus `_common.py` (shared `SpaceConfig` dataclass + `self_check()` helper,
 no `ImageNet_MBV2` imports at module load time) and `__init__.py` (registry).
@@ -102,10 +117,10 @@ cd AZ-NAS/adapters/spaces
 
   | Family | Init FLOPs (measured) | `budget_flops` |
   |--------|------------------------|----------------|
-  | `rgb28` | ~2.1M | 5M |
+  | `rgb28` | ~2.8M (at padded 32×32) | 6M |
   | `rgb64` | ~3.7M | 15M |
   | `rgb32` | ~2.9M | 8M |
-  | `gray_sq` | ~1.7M | 5M |
+  | `gray_sq` | ~2.7M (at padded 32×32) | 6M |
   | `board12` | ~2.2M | 8M |
 
 - **Stride policy is resolution-aware, not copy-pasted from ImageNet:**
@@ -119,9 +134,14 @@ cd AZ-NAS/adapters/spaces
   - `board12`: **only one** stride-2 stage total (locked constraint — 8x8
     board encoding must never collapse below 2x2); stem and two of three
     body stages are stride-1.
-- **`gray_sq` assumes padding already happened upstream.** `grow_data.py`
-  (separate todo) is responsible for padding Gutenberg's native `27x18` to
-  square `27x27` before this space's `input_image_size=27` is used.
+- **`rgb28`/`gray_sq` assume padding already happened upstream.**
+  `grow_data.py` pads multnist's native `28x28` and gutenberg's native
+  `27x18` both to square `32x32` before either space's
+  `input_image_size=32` is used -- **not** their native/previously-locked
+  sizes (`28x28` / `27x27`). This is the AZ-NAS proxy geometry policy (see
+  above): AZ-NAS's PixelUnshuffle-based trainability term requires every
+  stride-2 downsample to divide evenly, which `28x28` and `27x27` both
+  fail partway through a standard 3x stride-2 body, while `32x32` does not.
 - **Every `SpaceConfig` self-check asserts the resolution trace never drops
   below 2** at any point (not just at the end), matching the plan's
   `board12` constraint but enforced generically for all five families.
