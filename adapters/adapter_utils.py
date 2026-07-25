@@ -87,22 +87,69 @@ def resolve_mbv2_root(az_nas_root: Path | None = None) -> Path:
     return root / "ImageNet_MBV2"
 
 
+def _looks_like_grow_root(root: Path) -> bool:
+    return (root / "hydra_script" / "configs").is_dir()
+
+
+def _documented_grow_candidates() -> list[Path]:
+    """Documented dual-worktree grow paths (never the AZ-NAS.worktrees sibling)."""
+    home = Path.home()
+    return [
+        home / ".cursor" / "worktrees" / "experimental_grow" / "aznas",
+        home / "experimental_grow.worktrees" / "aznas-compare",
+        home / "Projects" / "research" / "experimental_grow.worktrees" / "aznas-compare",
+    ]
+
+
 def resolve_grow_root() -> Path:
-    """`experimental_grow` repo root: `EXPERIMENTAL_GROW_ROOT` env var if set,
-    else the sibling of the AZ-NAS repo root. Mirrors `grow_data._resolve_grow_root`.
+    """Resolve the ``experimental_grow`` repo root used for Hydra datasets.
+
+    Order:
+      1. ``EXPERIMENTAL_GROW_ROOT`` if set (must contain ``hydra_script/configs``)
+      2. Documented worktree paths (Cursor-native, cluster ``$HOME/.../aznas-compare``,
+         local legacy sibling worktree)
+      3. Main ``experimental_grow`` sibling of an AZ-NAS *main* clone only
+
+    Deliberately refuses the silent footgun
+    ``<AZ-NAS.worktrees>/experimental_grow`` (wrong sibling under the AZ-NAS
+    worktrees parent). Cluster jobs must set ``EXPERIMENTAL_GROW_ROOT`` to
+    ``$HOME/experimental_grow.worktrees/aznas-compare``.
     """
     env_root = os.environ.get("EXPERIMENTAL_GROW_ROOT")
     if env_root:
         root = Path(env_root).expanduser().resolve()
-    else:
-        root = resolve_az_nas_root().parent / "experimental_grow"
-    if not (root / "hydra_script" / "configs").is_dir():
+        if not _looks_like_grow_root(root):
+            raise FileNotFoundError(
+                f"EXPERIMENTAL_GROW_ROOT={root!s} lacks hydra_script/configs. "
+                "Set it to a real experimental_grow checkout "
+                "(cluster: $HOME/experimental_grow.worktrees/aznas-compare)."
+            )
+        return root
+
+    for cand in _documented_grow_candidates():
+        if cand.is_dir() and _looks_like_grow_root(cand):
+            return cand.resolve()
+
+    az_nas_root = resolve_az_nas_root()
+    az_parent = az_nas_root.parent
+    # Refuse AZ-NAS.worktrees/experimental_grow (common wrong sibling).
+    if az_parent.name == "AZ-NAS.worktrees" or "AZ-NAS.worktrees" in az_parent.parts:
         raise FileNotFoundError(
-            f"Cannot find an experimental_grow checkout at {root!s} "
-            "(expected hydra_script/configs under it). Set EXPERIMENTAL_GROW_ROOT "
-            "to override the resolved path."
+            "Cannot resolve experimental_grow from an AZ-NAS worktree without "
+            "EXPERIMENTAL_GROW_ROOT. Refusing silent sibling "
+            f"{az_parent / 'experimental_grow'!s}. Set EXPERIMENTAL_GROW_ROOT to "
+            "$HOME/experimental_grow.worktrees/aznas-compare (cluster) or "
+            "~/.cursor/worktrees/experimental_grow/aznas (local Cursor)."
         )
-    return root
+
+    sibling = az_parent / "experimental_grow"
+    if _looks_like_grow_root(sibling):
+        return sibling.resolve()
+
+    raise FileNotFoundError(
+        f"Cannot find an experimental_grow checkout near {az_nas_root!s} "
+        "(expected hydra_script/configs). Set EXPERIMENTAL_GROW_ROOT to override."
+    )
 
 
 def resolve_results_dir(grow_root: Path | None = None) -> Path:
@@ -132,6 +179,13 @@ def _ensure_grow_on_syspath(grow_root: Path) -> None:
 # Git provenance (dual SHAs + dirty flags, per result_schema.md)
 # ---------------------------------------------------------------------------
 
+_PROVENANCE_REQUIRED_KEYS = (
+    "experimental_grow_sha",
+    "experimental_grow_dirty",
+    "az_nas_sha",
+    "az_nas_dirty",
+)
+
 
 def git_sha_and_dirty(repo_root: Path) -> tuple[str, bool]:
     """Best-effort `git rev-parse HEAD` + dirty-tree check for `repo_root`.
@@ -139,6 +193,10 @@ def git_sha_and_dirty(repo_root: Path) -> tuple[str, bool]:
     Returns `("unknown", True)` on any failure (not a repo, `git` missing,
     timeout, ...) rather than raising -- provenance is best-effort and must
     never abort a scoring run.
+
+    For paper corpus rows, prefer :func:`load_provenance_freeze` /
+    ``--provenance-file`` / ``AZ_NAS_PROVENANCE_FILE`` so SHA+dirty are frozen
+    at job start — do **not** rely on this live call alone after scoring starts.
     """
     try:
         sha_proc = subprocess.run(
@@ -178,6 +236,142 @@ def git_sha(repo_root: Path) -> str:
 def git_dirty(repo_root: Path) -> bool:
     """See :func:`git_sha`."""
     return git_sha_and_dirty(repo_root)[1]
+
+
+def resolve_provenance_path(explicit: str | Path | None = None) -> Path | None:
+    """Resolve a job-start provenance freeze file path, or None if unset."""
+    if explicit is not None:
+        return Path(explicit).expanduser().resolve()
+    env = os.environ.get("AZ_NAS_PROVENANCE_FILE")
+    if env:
+        return Path(env).expanduser().resolve()
+    return None
+
+
+def load_provenance_freeze(
+    path: str | Path | None = None,
+) -> dict[str, Any] | None:
+    """Load dual-SHA+dirty freeze from ``--provenance-file`` / env, or None.
+
+    When a path is set (CLI or ``AZ_NAS_PROVENANCE_FILE``), the file **must**
+    exist and contain the four required SHA/dirty keys — missing freeze is a
+    hard error (paper mode must not silently fall back to live porcelain).
+    """
+    resolved = resolve_provenance_path(path)
+    if resolved is None:
+        return None
+    if not resolved.is_file():
+        raise FileNotFoundError(
+            f"Provenance freeze file not found: {resolved}. "
+            "Pass --provenance-file or set AZ_NAS_PROVENANCE_FILE to the "
+            "job-start provenance.json written before scoring."
+        )
+    data = json.loads(resolved.read_text())
+    missing = [k for k in _PROVENANCE_REQUIRED_KEYS if k not in data]
+    if missing:
+        raise ValueError(
+            f"Provenance freeze {resolved} missing required key(s): {missing}"
+        )
+    return data
+
+
+def resolve_dual_sha_dirty(
+    grow_root: Path,
+    az_nas_root: Path,
+    *,
+    provenance: dict[str, Any] | None = None,
+    provenance_path: str | Path | None = None,
+) -> tuple[str, bool, str, bool]:
+    """Return (grow_sha, grow_dirty, az_sha, az_dirty).
+
+    Prefer a job-start freeze (``provenance`` dict, or load from
+    ``provenance_path`` / ``AZ_NAS_PROVENANCE_FILE``). Only fall back to live
+    :func:`git_sha_and_dirty` when no freeze is configured (local/dev).
+    """
+    freeze = provenance
+    if freeze is None:
+        freeze = load_provenance_freeze(provenance_path)
+    if freeze is not None:
+        return (
+            str(freeze["experimental_grow_sha"]),
+            bool(freeze["experimental_grow_dirty"]),
+            str(freeze["az_nas_sha"]),
+            bool(freeze["az_nas_dirty"]),
+        )
+    grow_sha, grow_dirty = git_sha_and_dirty(grow_root)
+    az_sha, az_dirty = git_sha_and_dirty(az_nas_root)
+    return grow_sha, grow_dirty, az_sha, az_dirty
+
+
+# ---------------------------------------------------------------------------
+# MasterNet seeding + torch/CUDA device extras (paper-mode pre-submit gate)
+# ---------------------------------------------------------------------------
+
+
+def seed_for_masternet(seed: int) -> None:
+    """Seed numpy / torch / CUDA RNGs **before** MasterNet build (paper protocol)."""
+    import torch  # noqa: PLC0415
+
+    np.random.seed(int(seed))
+    torch.manual_seed(int(seed))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(int(seed))
+
+
+def torch_device_extras(*, device: str) -> dict[str, Any]:
+    """Record ``torch_version`` / ``torch_cuda_version`` / ``gpu_name`` for JSON."""
+    import torch  # noqa: PLC0415
+
+    extras: dict[str, Any] = {
+        "torch_version": torch.__version__,
+        "torch_cuda_version": torch.version.cuda,
+        "gpu_name": None,
+    }
+    if torch.cuda.is_available() and str(device).startswith("cuda"):
+        idx = 0
+        if ":" in str(device):
+            try:
+                idx = int(str(device).split(":", 1)[1])
+            except ValueError:
+                idx = 0
+        extras["gpu_name"] = torch.cuda.get_device_name(idx)
+    return extras
+
+
+def assert_scipy_available() -> None:
+    """Hard-fail helper: ``az_nas_rank_sum`` needs scipy in the MBV2 venv."""
+    try:
+        from scipy import stats  # noqa: F401, PLC0415
+    except ImportError as exc:
+        raise ImportError(
+            "scipy is required for az_nas_rank_sum (matrix appendix). "
+            "Install scipy into the MBV2 .venv-mbv2 (Phase 1 bootstrap)."
+        ) from exc
+
+
+def assert_paper_ready() -> None:
+    """Machine-checkable paper-mode gate (seed + extras + provenance freeze API).
+
+    Used by ``submit_cluster.sh`` / ``--paper-ready`` before paper-eligible
+    submit. Ops-only debug may skip this gate but cannot be promoted to the
+    paper corpus.
+    """
+    import inspect  # noqa: PLC0415
+
+    if not callable(seed_for_masternet):
+        raise AssertionError("seed_for_masternet missing")
+    if not callable(load_provenance_freeze):
+        raise AssertionError("load_provenance_freeze missing")
+    if not callable(torch_device_extras):
+        raise AssertionError("torch_device_extras missing")
+    src = inspect.getsource(build_result_record)
+    for marker in ("torch_version", "torch_cuda_version", "gpu_name", "resolve_dual_sha_dirty"):
+        if marker not in src:
+            raise AssertionError(
+                f"build_result_record does not reference {marker!r} "
+                "(paper-mode extras / provenance freeze not wired)"
+            )
+    assert_scipy_available()
 
 
 # ---------------------------------------------------------------------------
@@ -385,13 +579,21 @@ def load_batch(
 # ---------------------------------------------------------------------------
 
 
-def build_model_from_space(space_cfg: Any, num_classes: int) -> Any:
+def build_model_from_space(
+    space_cfg: Any, num_classes: int, *, seed: int | None = None
+) -> Any:
     """Build a `MasterNet` from `space_cfg.init_plainnet_str`. Must be called
     inside :func:`mbv2_context`. `num_classes` must come from grow's Hydra
     `cfg.dataset_config.num_classes` (the "Replace getmisc()" contract in the
     plan), never from `space_cfg.num_classes_hint`.
+
+    When ``seed`` is given, seeds numpy/torch/CUDA RNGs via
+    :func:`seed_for_masternet` **before** constructing MasterNet (paper protocol).
     """
     import Masternet  # noqa: PLC0415 (MBV2-local; only valid inside mbv2_context)
+
+    if seed is not None:
+        seed_for_masternet(seed)
 
     return Masternet.MasterNet(
         num_classes=num_classes,
@@ -517,14 +719,25 @@ def build_result_record(
     skip_latency: bool,
     device: str,
     extra: dict[str, Any] | None = None,
+    provenance: dict[str, Any] | None = None,
+    provenance_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Build one result dict matching the minimum JSON contract in
     `experiments/AZ-NAS/result_schema.md`. `extra` may add adapter-specific
     fields (e.g. `run_score_matrix.py`'s `matrix_rank_sum`) beyond the
     required set -- the schema explicitly allows this.
+
+    Dual SHA+dirty fields prefer a job-start provenance freeze
+    (``provenance`` / ``provenance_path`` / ``AZ_NAS_PROVENANCE_FILE``) over
+    live :func:`git_sha_and_dirty`. Always records ``torch_version``,
+    ``torch_cuda_version``, and ``gpu_name`` (paper-mode extras locus).
     """
-    grow_sha, grow_dirty = git_sha_and_dirty(grow_root)
-    az_sha, az_dirty = git_sha_and_dirty(az_nas_root)
+    grow_sha, grow_dirty, az_sha, az_dirty = resolve_dual_sha_dirty(
+        grow_root,
+        az_nas_root,
+        provenance=provenance,
+        provenance_path=provenance_path,
+    )
     record: dict[str, Any] = {
         "dataset": dataset,
         "seed": seed,
@@ -544,6 +757,7 @@ def build_result_record(
         "skip_latency": skip_latency,
         "device": device,
     }
+    record.update(torch_device_extras(device=device))
     if extra:
         record.update(extra)
     return record

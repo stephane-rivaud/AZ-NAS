@@ -142,7 +142,28 @@ venv and pass tensors/metadata across, or accept CPU-only proxy scores using
 only `cifar10`-style loaders directly importable in MBV2). That decision is
 explicitly **not** made here — flagging it for the `smoke-score` todo.
 
+### scipy (required for `az_nas_rank_sum` appendix)
+
+`adapter_utils.compute_matrix_rank_sum` lazily imports `from scipy import stats`
+(used by `run_score_matrix.py`'s population rank-sum). Install **scipy** into
+`.venv-mbv2` on cluster (Phase 1 bootstrap). Local CPU smoke can omit it until
+you run a multi-dataset matrix; `assert_scipy_available()` / `--paper-ready`
+hard-fail if missing before paper-mode submit.
+
+```bash
+# inside .venv-mbv2
+pip install scipy
+# or: uv pip install --python .venv-mbv2/bin/python scipy
+```
+
 ### Blockers / follow-ups for later phases
 
 - **No CUDA on this dev machine.** `rand_input=False` scoring and any latency benchmarking will run CPU-only here; real GPU runs (or the `skip_latency=True` matrix runner) need to target a CUDA host. Document this in `experiments/AZ-NAS/README.md` dual-env / CUDA-assumption section (owned by `scaffold-experiments` / `docs-disclaimer` todos).
 - apex/horovod/tensorflow gaps above are believed non-blocking for smoke + matrix scoring (proxy score path doesn't import them), but flagging here in case a later phase's import graph pulls in `global_utils.py` code paths that need them — if so, install `tensorflow==2.12.0` (pip-installable, no CUDA needed for logging-only use) as a follow-up; apex/horovod remain out of reach on this host without a CUDA toolchain.
+- **Grow-root resolution:** adapters refuse the silent footgun
+  `AZ-NAS.worktrees/experimental_grow`. Set `EXPERIMENTAL_GROW_ROOT` to a
+  dedicated worktree (`$HOME/experimental_grow.worktrees/aznas-compare` on
+  cluster).
+- **Provenance freeze:** paper SHA+dirty come from job-start
+  `provenance.json` via `--provenance-file` / `AZ_NAS_PROVENANCE_FILE`, not
+  live `git status` after scoring starts.

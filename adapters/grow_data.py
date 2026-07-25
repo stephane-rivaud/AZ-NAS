@@ -67,24 +67,53 @@ _MULTNIST_PAD_LTRB: tuple[int, int, int, int] = (2, 2, 2, 2)
 def _resolve_grow_root() -> Path:
     """Resolve the ``experimental_grow`` repo root.
 
-    Order: ``EXPERIMENTAL_GROW_ROOT`` env var if set, else the sibling of the
-    AZ-NAS repo root (this file lives at ``<AZ-NAS-root>/adapters/grow_data.py``,
-    so ``parents[1]`` is the AZ-NAS root and ``parents[2]`` is its parent
-    directory, where ``experimental_grow`` is expected to live).
+    Order: ``EXPERIMENTAL_GROW_ROOT`` if set, else documented worktree paths
+    (Cursor-native / cluster ``aznas-compare`` / local legacy), else a main
+    ``experimental_grow`` sibling of an AZ-NAS *main* clone. Never silently
+    picks ``AZ-NAS.worktrees/experimental_grow`` (wrong sibling footgun).
+    Mirrors ``adapter_utils.resolve_grow_root``.
     """
     env_root = os.environ.get("EXPERIMENTAL_GROW_ROOT")
     if env_root:
         root = Path(env_root).expanduser().resolve()
-    else:
-        root = Path(__file__).resolve().parents[2] / "experimental_grow"
+        if not (root / "hydra_script" / "configs").is_dir():
+            raise FileNotFoundError(
+                f"EXPERIMENTAL_GROW_ROOT={root!s} lacks hydra_script/configs. "
+                "Set it to a real experimental_grow checkout "
+                "(cluster: $HOME/experimental_grow.worktrees/aznas-compare)."
+            )
+        return root
 
-    if not (root / "hydra_script" / "configs").is_dir():
+    home = Path.home()
+    candidates = [
+        home / ".cursor" / "worktrees" / "experimental_grow" / "aznas",
+        home / "experimental_grow.worktrees" / "aznas-compare",
+        home / "Projects" / "research" / "experimental_grow.worktrees" / "aznas-compare",
+    ]
+    for cand in candidates:
+        if cand.is_dir() and (cand / "hydra_script" / "configs").is_dir():
+            return cand.resolve()
+
+    az_nas_root = Path(__file__).resolve().parents[1]
+    az_parent = az_nas_root.parent
+    if az_parent.name == "AZ-NAS.worktrees" or "AZ-NAS.worktrees" in az_parent.parts:
         raise FileNotFoundError(
-            f"Cannot find an experimental_grow checkout at {root!s} "
-            "(expected hydra_script/configs under it). Set EXPERIMENTAL_GROW_ROOT "
-            "to override the resolved path."
+            "Cannot resolve experimental_grow from an AZ-NAS worktree without "
+            "EXPERIMENTAL_GROW_ROOT. Refusing silent sibling "
+            f"{az_parent / 'experimental_grow'!s}. Set EXPERIMENTAL_GROW_ROOT to "
+            "$HOME/experimental_grow.worktrees/aznas-compare (cluster) or "
+            "~/.cursor/worktrees/experimental_grow/aznas (local Cursor)."
         )
-    return root
+
+    sibling = az_parent / "experimental_grow"
+    if (sibling / "hydra_script" / "configs").is_dir():
+        return sibling.resolve()
+
+    raise FileNotFoundError(
+        f"Cannot find an experimental_grow checkout at {sibling!s} "
+        "(expected hydra_script/configs under it). Set EXPERIMENTAL_GROW_ROOT "
+        "to override the resolved path."
+    )
 
 
 def _ensure_grow_on_syspath(grow_root: Path) -> None:

@@ -124,6 +124,7 @@ def run_smoke_score(
     az_nas_root: Path | None = None,
     allow_download: bool = False,
     uv_bin: str = "uv",
+    provenance_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Run one AZ-NAS proxy smoke score and return the full result record.
 
@@ -143,6 +144,7 @@ def run_smoke_score(
 
     az_nas_root = az_nas_root or adapter_utils.resolve_az_nas_root()
     grow_root = grow_root or adapter_utils.resolve_grow_root()
+    provenance = adapter_utils.load_provenance_freeze(provenance_path)
     space_cfg = get_space(dataset_config)
 
     use_cuda = gpu is not None
@@ -175,7 +177,7 @@ def run_smoke_score(
 
     start = time.time()
     with adapter_utils.mbv2_context(az_nas_root):
-        net = adapter_utils.build_model_from_space(space_cfg, num_classes)
+        net = adapter_utils.build_model_from_space(space_cfg, num_classes, seed=seed)
 
         if use_cuda:
             net = net.to(device)
@@ -214,12 +216,13 @@ def run_smoke_score(
         az_nas_root=az_nas_root,
         skip_latency=True,
         device=str(device),
+        provenance=provenance,
+        provenance_path=provenance_path,
         extra={
             "space_family": space_cfg.family,
             "batch_size_used": batch_size_used,
             "maxbatch": maxbatch,
             "elapsed_seconds": elapsed,
-            "torch_version": torch.__version__,
             "python_version": platform.python_version(),
         },
     )
@@ -231,7 +234,10 @@ def _parse_args() -> argparse.Namespace:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument(
-        "--dataset_config", required=True, help="grow Hydra dataset_config name, e.g. cifar10"
+        "--dataset_config",
+        required=False,
+        default=None,
+        help="grow Hydra dataset_config name, e.g. cifar10 (required unless --paper-ready)",
     )
     parser.add_argument(
         "--rand_input",
@@ -251,11 +257,33 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--uv_bin", default="uv")
     parser.add_argument("--grow_root", default=None)
     parser.add_argument("--az_nas_root", default=None)
+    parser.add_argument(
+        "--results_dir",
+        default=None,
+        help="override output directory (default: experimental_grow/experiments/AZ-NAS/results/)",
+    )
+    parser.add_argument(
+        "--provenance-file",
+        default=None,
+        dest="provenance_file",
+        help="job-start provenance.json freeze (or set AZ_NAS_PROVENANCE_FILE)",
+    )
+    parser.add_argument(
+        "--paper-ready",
+        action="store_true",
+        help="run machine-checkable paper-mode probe (seed+extras+provenance+scipy) and exit",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = _parse_args()
+    if args.paper_ready:
+        adapter_utils.assert_paper_ready()
+        print("[smoke_score] paper-ready: ok")
+        return 0
+    if not args.dataset_config:
+        raise SystemExit("--dataset_config is required unless --paper-ready")
     if args.rand_input:
         raise AssertionError(
             "--rand_input true is not allowed for smoke_score.py (locked decision, "
@@ -277,13 +305,17 @@ def main() -> int:
             az_nas_root=az_nas_root,
             allow_download=args.allow_download,
             uv_bin=args.uv_bin,
+            provenance_path=args.provenance_file,
         )
     except adapter_utils.DataUnavailableError as exc:
+        # Missing data: exit 0, write no JSON (matrix summary records skips).
         print(f"[skip] {args.dataset_config}: {exc}", file=sys.stderr)
         return 0
 
-    results_dir = adapter_utils.resolve_results_dir(
-        grow_root or adapter_utils.resolve_grow_root()
+    results_dir = (
+        Path(args.results_dir).expanduser().resolve()
+        if args.results_dir
+        else adapter_utils.resolve_results_dir(grow_root or adapter_utils.resolve_grow_root())
     )
     out_path = adapter_utils.write_result_json(
         record, results_dir, filename=f"smoke_{record['dataset']}_seed{record['seed']}.json"

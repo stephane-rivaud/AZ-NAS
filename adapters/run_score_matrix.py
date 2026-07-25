@@ -64,6 +64,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import traceback
 from pathlib import Path
@@ -112,6 +113,17 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--az_nas_root", default=None)
     parser.add_argument("--uv_bin", default="uv")
     parser.add_argument(
+        "--provenance-file",
+        default=None,
+        dest="provenance_file",
+        help="job-start provenance.json freeze (or set AZ_NAS_PROVENANCE_FILE)",
+    )
+    parser.add_argument(
+        "--paper-ready",
+        action="store_true",
+        help="run machine-checkable paper-mode probe (seed+extras+provenance+scipy) and exit",
+    )
+    parser.add_argument(
         "--dry_run",
         action="store_true",
         help="Skip every dataset unconditionally; exercises CLI/result plumbing only.",
@@ -126,6 +138,7 @@ def _score_one_dataset(
     grow_root: Path,
     az_nas_root: Path,
     cuda_available: bool,
+    provenance: dict[str, Any] | None,
 ) -> dict[str, Any]:
     """Run the full per-dataset pipeline; always returns a status dict, never raises
     (all failure modes -- missing data, missing CUDA, non-finite scores, unexpected
@@ -180,7 +193,9 @@ def _score_one_dataset(
 
             device = torch.device(device_str)
             batches_on_device = [[x.to(device), y.to(device)] for x, y in batches]
-            model = adapter_utils.build_model_from_space(space_cfg, meta["num_classes"])
+            model = adapter_utils.build_model_from_space(
+                space_cfg, meta["num_classes"], seed=args.seed
+            )
             model = model.to(device)
 
             info = adapter_utils.compute_zero_shot_score(
@@ -228,15 +243,37 @@ def _score_one_dataset(
         az_nas_root=az_nas_root,
         skip_latency=True,
         device=device_str,
-        extra={"family": space_cfg.family},
+        provenance=provenance,
+        provenance_path=args.provenance_file,
+        extra={"family": space_cfg.family, "status": "ok"},
     )
     entry["status"] = "ok"
     entry["record"] = record
     return entry
 
 
+def _slurm_meta() -> dict[str, Any]:
+    """Slurm / launcher metadata for matrix_summary (env-exported by the job)."""
+    return {
+        "slurm_job_id": os.environ.get("SLURM_JOB_ID")
+        or os.environ.get("AZ_NAS_SLURM_JOB_ID"),
+        "partition": os.environ.get("AZ_NAS_SLURM_PARTITION")
+        or os.environ.get("SLURM_JOB_PARTITION"),
+        "constraint": os.environ.get("AZ_NAS_SLURM_CONSTRAINT")
+        or os.environ.get("SLURM_JOB_CONSTRAINT"),
+        "node": os.environ.get("AZ_NAS_SLURM_NODE")
+        or os.environ.get("SLURMD_NODENAME")
+        or os.environ.get("SLURM_NODELIST"),
+    }
+
+
 def main() -> int:
     args = _parse_args()
+
+    if args.paper_ready:
+        adapter_utils.assert_paper_ready()
+        print("[run_score_matrix] paper-ready: ok")
+        return 0
 
     if args.rand_input:
         raise AssertionError(
@@ -265,13 +302,23 @@ def main() -> int:
         if args.results_dir
         else adapter_utils.resolve_results_dir(grow_root)
     )
+    provenance = adapter_utils.load_provenance_freeze(args.provenance_file)
 
     cuda_available = False
+    torch_extras: dict[str, Any] = {
+        "torch_version": None,
+        "torch_cuda_version": None,
+        "gpu_name": None,
+    }
     if not args.dry_run:
         with adapter_utils.mbv2_context(az_nas_root):
             import torch  # noqa: PLC0415
 
             cuda_available = torch.cuda.is_available()
+            device_for_extras = (
+                f"cuda:{args.gpu}" if args.gpu is not None else ("cuda:0" if cuda_available else "cpu")
+            )
+            torch_extras = adapter_utils.torch_device_extras(device=device_for_extras)
         if not cuda_available:
             print(
                 "[warn] No CUDA device visible on this host. "
@@ -297,6 +344,7 @@ def main() -> int:
             grow_root=grow_root,
             az_nas_root=az_nas_root,
             cuda_available=cuda_available,
+            provenance=provenance,
         )
         entries.append(entry)
         status = entry["status"]
@@ -315,8 +363,35 @@ def main() -> int:
         written_paths.append(path)
         print(f"wrote {path}")
 
+    grow_sha, grow_dirty, az_sha, az_dirty = adapter_utils.resolve_dual_sha_dirty(
+        grow_root,
+        az_nas_root,
+        provenance=provenance,
+        provenance_path=args.provenance_file,
+    )
+    if args.gpu is not None:
+        device_str = f"cuda:{args.gpu}"
+    else:
+        device_str = "cuda:0" if cuda_available else "cpu"
+
+    # Exact paper matrix_summary top-level keys (plan Phase 2).
     summary = {
+        "experimental_grow_sha": grow_sha,
+        "experimental_grow_dirty": grow_dirty,
+        "az_nas_sha": az_sha,
+        "az_nas_dirty": az_dirty,
+        "device": device_str,
         "seed": args.seed,
+        "batch_size": args.batch_size,
+        "maxbatch": args.maxbatch,
+        "gpu": args.gpu,
+        "dataset_configs": dataset_configs,
+        "allow_download": bool(args.allow_download),
+        "skip_latency": True,
+        **_slurm_meta(),
+        "torch_version": torch_extras.get("torch_version"),
+        "torch_cuda_version": torch_extras.get("torch_cuda_version"),
+        "gpu_name": torch_extras.get("gpu_name"),
         "zero_shot_score": args.zero_shot_score,
         "ranking_key": adapter_utils.AZ_NAS_RANK_SUM_KEY,
         "ranking_key_doc": adapter_utils.AZ_NAS_RANK_SUM_DOC,
@@ -328,6 +403,7 @@ def main() -> int:
                     "message": e.get("message"),
                     "matrix_rank_sum": rank_sums.get(e["dataset"]),
                     "info": e.get("record", {}).get("info"),
+                    "skip_latency": True,
                 }
                 for e in entries
             ),
