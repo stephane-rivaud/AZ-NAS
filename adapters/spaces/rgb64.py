@@ -1,4 +1,8 @@
-"""Shrunk search-space family: `rgb64` — 3x64x64 RGB, e.g. `cifartile`, `geoclassing`.
+"""Shrunk search-space family: `rgb64` — 3x64x64 RGB, e.g. `cifartile`.
+
+GeoClassing is **not** in this family: its measured native shape is
+`3x60x60` (see `rgb60.py`), padded to 64×64 for proxy scoring. Do not
+re-attach geoclassing here with a false `native_shape=(3,64,64)`.
 
 See `spaces/README.md` for the import contract. Run this module directly
 (inside the MBV2 venv) to self-check the init string:
@@ -17,7 +21,7 @@ except ImportError:  # running as a standalone script, not `python -m`
 
 CONFIG = SpaceConfig(
     family="rgb64",
-    datasets=("cifartile", "geoclassing"),
+    datasets=("cifartile",),
     native_shape=(3, 64, 64),
     in_channels=3,
     input_image_size=64,

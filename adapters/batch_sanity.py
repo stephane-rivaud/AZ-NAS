@@ -22,7 +22,7 @@ from pathlib import Path
 import grow_data
 
 # cifar10 first (smoke order), then the five P0 / matrix datasets (one per
-# shrunk-space family: rgb28, rgb64 x2, gray_sq, board12 -- see the plan's
+# shrunk-space family: rgb28, rgb64, rgb60, gray_sq, board12 -- see the plan's
 # search-space table).
 DATASETS: tuple[str, ...] = (
     "cifar10",

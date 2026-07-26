@@ -217,15 +217,19 @@ def _score_one_dataset(
     except Exception as exc:  # noqa: BLE001 - report and continue, never abort the matrix
         entry["status"] = "error_scoring"
         entry["message"] = f"{exc.__class__.__name__}: {exc}"
+        if "batch_shape" in meta:
+            entry["message"] += f" (batch_shape={tuple(meta['batch_shape'])})"
+            entry["batch_shape"] = list(meta["batch_shape"])
         if isinstance(exc, RuntimeError) and "cannot be multiplied" in str(exc):
             entry["message"] += (
                 " (known upstream limitation: compute_az_nas_score.py's trainability "
                 "score assumes every adjacent layer-feature resolution ratio is an "
-                "exact power-of-2 pixel_unshuffle stride -- e.g. rgb28/gray_sq's final "
-                "7->3 / 6->3 floor-division stage isn't exact. This is a stock "
-                "AZ-NAS bug at small/non-power-of-2 resolutions, not specific to "
-                "run_score_matrix.py; not patched here per the plan's no-vendoring "
-                "rule. rgb64/board12 families are unaffected.)"
+                "exact power-of-2 pixel_unshuffle stride -- e.g. native 28->14->7->3 / "
+                "27->13->6->3 / geoclassing 60->30->15->8 under rgb64-style strides. "
+                "Adapter pad policy: multnist/gutenberg ->32, geoclassing ->64. "
+                "This is a stock AZ-NAS bug at non-power-of-2 resolutions, not "
+                "specific to run_score_matrix.py; not patched here per the plan's "
+                "no-vendoring rule.)"
             )
         traceback.print_exc(file=sys.stderr)
         return entry

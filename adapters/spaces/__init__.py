@@ -9,12 +9,13 @@ See `README.md` in this directory for the full import contract. Quick start:
     print(cfg.init_plainnet_str, cfg.budget_flops, cfg.max_layers)
 """
 
-from . import board12, gray_sq, rgb28, rgb32, rgb64
+from . import board12, gray_sq, rgb28, rgb32, rgb60, rgb64
 from ._common import SpaceConfig
 
 FAMILIES = {
     "rgb28": rgb28.CONFIG,
     "rgb64": rgb64.CONFIG,
+    "rgb60": rgb60.CONFIG,
     "rgb32": rgb32.CONFIG,
     "gray_sq": gray_sq.CONFIG,
     "board12": board12.CONFIG,

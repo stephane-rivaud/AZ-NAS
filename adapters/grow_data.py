@@ -16,21 +16,22 @@ Locked contract (see ``.cursor/plans/az-nas_grow_adapters_0b7a938b.plan.md``):
   pipeline, so proxy scoring never sees training-time augmentation.
 - Gutenberg and multnist are padded to a square ``32x32`` in the adapter's
   own transform chain (not in grow's YAML) -- **not** their native shapes
-  (``(1, 27, 18)`` / ``(3, 28, 28)``). This is the AZ-NAS proxy geometry
-  policy (see ``adapters/spaces/README.md``): AZ-NAS's
-  ``compute_az_nas_score`` trainability term relies on
+  (``(1, 27, 18)`` / ``(3, 28, 28)``). GeoClassing is padded to ``64x64``
+  from its measured native ``(3, 60, 60)`` (on-disk npy and post-ToTensor
+  ``batch_shape``; the zip README/metadata ``64x64`` claim is stale). This
+  is the AZ-NAS proxy geometry policy (see ``adapters/spaces/README.md``):
+  AZ-NAS's ``compute_az_nas_score`` trainability term relies on
   ``nn.PixelUnshuffle`` to reconcile mismatched feature-map resolutions
   between adjacent layers, which requires every stride-2 downsample in the
   resolution trace to divide evenly (``PixelUnshuffle`` raises on a
-  non-integer/non-divisible ratio). Both datasets' native sizes hit a
+  non-integer/non-divisible ratio). Multnist/gutenberg native sizes hit a
   non-power-of-two spatial size partway through the standard 3x stride-2
-  body (28->14->7->3 and 27->13->6->3, where the last stride hits an odd
-  input), which crashes ``compute_az_nas_score.compute_nas_score`` before
-  it can even measure trainability. Padding to 32x32 (a clean power of two)
-  keeps every stride-2 step exact (32->16->8->4) and makes both datasets
-  score cleanly, matching ``rgb32``'s already-verified geometry. Native
-  shapes on disk are unchanged; only the proxy/search-facing transform
-  pipeline composed here pads them.
+  body (28->14->7->3 and 27->13->6->3); geoclassing under an rgb64-style
+  stride-2 stem hits ``60->30->15->8`` (15 vs 8 is not an exact power-of-2
+  unshuffle ratio). Padding to the next clean power-of-two square
+  (32x32 / 64x64) keeps every stride-2 step exact. Native shapes on disk
+  are unchanged; only the proxy/search-facing transform pipeline composed
+  here pads them.
 - The first training batch is asserted to be ``BCHW`` float with labels and
   no NaN/Inf before being handed back to the caller.
 """
@@ -47,12 +48,13 @@ import torch
 import torch.utils.data
 from omegaconf import DictConfig, OmegaConf
 
-# AZ-NAS proxy geometry policy (see module docstring): both gutenberg and
-# multnist are padded to a square 32x32 -- not their native shapes -- so
-# every stride-2 downsample AZ-NAS's PixelUnshuffle-based trainability term
-# needs stays evenly divisible. torchvision.transforms.Pad's padding order
-# is (left, top, right, bottom).
-_PAD_TARGET_SIZE = 32
+# AZ-NAS proxy geometry policy (see module docstring): pad selected datasets
+# to the next PixelUnshuffle-safe power-of-two square -- not their native
+# shapes -- so every stride-2 downsample AZ-NAS's trainability term needs
+# stays evenly divisible. torchvision.transforms.Pad's padding order is
+# (left, top, right, bottom).
+_PAD_TARGET_SIZE = 32  # gutenberg / multnist
+_GEOCLASSING_PAD_TARGET_SIZE = 64
 
 # Gutenberg native standard-pipeline output is (1, 27, 18): width needs
 # +14 (18 -> 32, split 7/7), height needs +5 (27 -> 32, split 2/3 since the
@@ -62,6 +64,17 @@ _GUTENBERG_PAD_LTRB: tuple[int, int, int, int] = (7, 2, 7, 3)
 # Multnist native standard-pipeline output is (3, 28, 28): both dimensions
 # need +4 (28 -> 32), split evenly 2/2.
 _MULTNIST_PAD_LTRB: tuple[int, int, int, int] = (2, 2, 2, 2)
+
+# GeoClassing measured native is (3, 60, 60): both dimensions need +4
+# (60 -> 64), split evenly 2/2.
+_GEOCLASSING_PAD_LTRB: tuple[int, int, int, int] = (2, 2, 2, 2)
+
+# dataset_config.name -> expected (H, W) after adapter pad (proxy only).
+_PADDED_SQUARE_EXPECTATIONS: dict[str, int] = {
+    "gutenberg": _PAD_TARGET_SIZE,
+    "multnist": _PAD_TARGET_SIZE,
+    "geoclassing": _GEOCLASSING_PAD_TARGET_SIZE,
+}
 
 
 def _resolve_grow_root() -> Path:
@@ -155,10 +168,11 @@ def _compose_dataset_cfg(
 def _apply_square_pad(dataset_cfg: DictConfig, pad_ltrb: tuple[int, int, int, int]) -> None:
     """Rewrite the ``standard`` transform pipeline to append a fixed square pad.
 
-    AZ-NAS proxy geometry policy (see module docstring): gutenberg and
-    multnist must only ever be scored at the padded square 32x32, never
-    their native shapes. This mutates only the composed in-memory config for
-    this run, never the checked-in YAML -- native data on disk is untouched.
+    AZ-NAS proxy geometry policy (see module docstring): gutenberg/multnist
+    must only ever be scored at the padded square 32x32, and geoclassing at
+    padded 64x64, never their native shapes. This mutates only the composed
+    in-memory config for this run, never the checked-in YAML -- native data
+    on disk is untouched.
     """
     standard = dataset_cfg.transforms.standard
     transforms_list: list[dict[str, Any]] = OmegaConf.to_container(
@@ -305,6 +319,8 @@ def load(
         _apply_square_pad(dataset_cfg, _GUTENBERG_PAD_LTRB)
     elif dataset_cfg.name == "multnist":
         _apply_square_pad(dataset_cfg, _MULTNIST_PAD_LTRB)
+    elif dataset_cfg.name == "geoclassing":
+        _apply_square_pad(dataset_cfg, _GEOCLASSING_PAD_LTRB)
 
     split_train_val = float(dataset_cfg.split_train_val)
     splits = _build_splits(split_train_val)
@@ -324,10 +340,11 @@ def load(
     assert_batch_sane(batch_x, batch_y, dataset_name=dataset_cfg.name)
 
     num_channels, height, width = (int(d) for d in batch_x.shape[1:])
-    if dataset_cfg.name in ("gutenberg", "multnist"):
-        assert (height, width) == (_PAD_TARGET_SIZE, _PAD_TARGET_SIZE), (
-            f"{dataset_cfg.name}: expected padded square ({_PAD_TARGET_SIZE}, "
-            f"{_PAD_TARGET_SIZE}), got ({height}, {width})"
+    if dataset_cfg.name in _PADDED_SQUARE_EXPECTATIONS:
+        pad_side = _PADDED_SQUARE_EXPECTATIONS[dataset_cfg.name]
+        assert (height, width) == (pad_side, pad_side), (
+            f"{dataset_cfg.name}: expected padded square ({pad_side}, "
+            f"{pad_side}), got ({height}, {width})"
         )
 
     meta: dict[str, Any] = {
