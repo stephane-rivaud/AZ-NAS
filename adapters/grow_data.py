@@ -16,22 +16,15 @@ Locked contract (see ``.cursor/plans/az-nas_grow_adapters_0b7a938b.plan.md``):
   pipeline, so proxy scoring never sees training-time augmentation.
 - Gutenberg and multnist are padded to a square ``32x32`` in the adapter's
   own transform chain (not in grow's YAML) -- **not** their native shapes
-  (``(1, 27, 18)`` / ``(3, 28, 28)``). GeoClassing is padded to ``64x64``
-  from its measured native ``(3, 60, 60)`` (on-disk npy and post-ToTensor
-  ``batch_shape``; the zip README/metadata ``64x64`` claim is stale). This
-  is the AZ-NAS proxy geometry policy (see ``adapters/spaces/README.md``):
-  AZ-NAS's ``compute_az_nas_score`` trainability term relies on
-  ``nn.PixelUnshuffle`` to reconcile mismatched feature-map resolutions
-  between adjacent layers, which requires every stride-2 downsample in the
-  resolution trace to divide evenly (``PixelUnshuffle`` raises on a
-  non-integer/non-divisible ratio). Multnist/gutenberg native sizes hit a
-  non-power-of-two spatial size partway through the standard 3x stride-2
-  body (28->14->7->3 and 27->13->6->3); geoclassing under an rgb64-style
-  stride-2 stem hits ``60->30->15->8`` (15 vs 8 is not an exact power-of-2
-  unshuffle ratio). Padding to the next clean power-of-two square
-  (32x32 / 64x64) keeps every stride-2 step exact. Native shapes on disk
-  are unchanged; only the proxy/search-facing transform pipeline composed
-  here pads them.
+  (``(1, 27, 18)`` / ``(3, 28, 28)``) -- when ``pad_for_proxy=True`` (default,
+  zero-cost search). GeoClassing is padded to ``64x64`` from its measured
+  native ``(3, 60, 60)``. This is the AZ-NAS proxy geometry policy (see
+  ``adapters/spaces/README.md``): AZ-NAS's ``compute_az_nas_score``
+  trainability term relies on ``nn.PixelUnshuffle``, which needs even
+  stride-2 ratios. Full 200-ep train passes ``pad_for_proxy=False`` (native
+  shapes) and ``train_transforms="auto"`` (augmented when YAML defines it).
+  Native shapes on disk are unchanged; only the proxy/search-facing
+  transform pipeline pads them.
 - The first training batch is asserted to be ``BCHW`` float with labels and
   no NaN/Inf before being handed back to the caller.
 """
@@ -195,18 +188,24 @@ def _apply_square_pad(dataset_cfg: DictConfig, pad_ltrb: tuple[int, int, int, in
     )
 
 
-def _build_splits(split_train_val: float) -> dict[str, dict[str, Any]]:
-    """Standard-only train/val/test split descriptors for ``get_dataloaders``.
+def _build_splits(
+    split_train_val: float,
+    *,
+    train_transforms: str = "standard",
+) -> dict[str, dict[str, Any]]:
+    """Train/val/test split descriptors for ``get_dataloaders``.
 
-    Locked: every split uses ``transforms="standard"`` -- proxy scoring never
-    trains on augmented data. ``val`` is omitted when ``split_train_val<=0``
-    (matches ``create_dataloaders``'s own zero-split handling).
+    Proxy / zero-cost search: every split uses ``transforms="standard"``
+    (``pad_for_proxy`` path). Full 200-ep train may pass
+    ``train_transforms="augmented"`` (or ``"auto"`` resolved by the caller)
+    for the train split only — val/test stay ``standard``. ``val`` is omitted
+    when ``split_train_val<=0``.
     """
     splits: dict[str, dict[str, Any]] = {
         "train": {
             "source": "train",
             "proportion": 1.0 - split_train_val if split_train_val > 0 else 1.0,
-            "transforms": "standard",
+            "transforms": train_transforms,
             "shuffle": True,
             "drop_last": True,
         },
@@ -259,8 +258,10 @@ def load(
     device: torch.device | str = "cpu",
     grow_root: str | os.PathLike[str] | None = None,
     download: bool | None = None,
+    pad_for_proxy: bool = True,
+    train_transforms: str = "standard",
 ) -> tuple[torch.utils.data.DataLoader, dict[str, Any]]:
-    """Load grow's standard-transform dataloaders for ``dataset_config``.
+    """Load grow dataloaders for ``dataset_config``.
 
     Parameters
     ----------
@@ -295,6 +296,14 @@ def load(
         gates torchvision-style datasets (e.g. cifar10) cleanly. Callers
         that must never touch the network (like ``batch_sanity.py``) check
         filesystem existence themselves instead of relying on this flag.
+    pad_for_proxy
+        When True (default), apply AZ-NAS proxy geometry pads (multnist /
+        gutenberg → 32, geoclassing → 64) for zero-cost scoring. When False,
+        keep **native** grow shapes for 200-ep train.
+    train_transforms
+        Transform key for the train split: ``"standard"`` (proxy/search),
+        ``"augmented"`` (train when YAML defines it), or ``"auto"`` (use
+        grow's ``resolve_train_transform_key``).
 
     Returns
     -------
@@ -302,28 +311,36 @@ def load(
         ``(train_loader, meta)``. ``meta`` contains at least ``dataset``,
         ``num_classes``, ``batch_shape`` (``(C, H, W)``), ``split_train_val``,
         and ``seed``, plus convenience fields (``val_loader``, ``test_loader``,
-        ``in_channels``, ``input_image_size``, ``image_shape``, ``transforms``)
-        for the not-yet-implemented ``smoke_score.py`` consumer contract.
+        ``in_channels``, ``input_image_size``, ``image_shape``, ``transforms``).
     """
     root = Path(grow_root) if grow_root is not None else _resolve_grow_root()
     _ensure_grow_on_syspath(root)
 
-    from hydra_script.data_handling.datasets import get_dataloaders
+    from hydra_script.data_handling.datasets import (
+        get_dataloaders,
+        resolve_train_transform_key,
+    )
 
     cfg = _compose_dataset_cfg(root, dataset_config, seed=seed, num_workers=num_workers)
     dataset_cfg = cfg.dataset_config
     if download is not None:
         dataset_cfg.dataset.download = download
 
-    if dataset_cfg.name == "gutenberg":
-        _apply_square_pad(dataset_cfg, _GUTENBERG_PAD_LTRB)
-    elif dataset_cfg.name == "multnist":
-        _apply_square_pad(dataset_cfg, _MULTNIST_PAD_LTRB)
-    elif dataset_cfg.name == "geoclassing":
-        _apply_square_pad(dataset_cfg, _GEOCLASSING_PAD_LTRB)
+    if pad_for_proxy:
+        if dataset_cfg.name == "gutenberg":
+            _apply_square_pad(dataset_cfg, _GUTENBERG_PAD_LTRB)
+        elif dataset_cfg.name == "multnist":
+            _apply_square_pad(dataset_cfg, _MULTNIST_PAD_LTRB)
+        elif dataset_cfg.name == "geoclassing":
+            _apply_square_pad(dataset_cfg, _GEOCLASSING_PAD_LTRB)
+
+    if train_transforms == "auto":
+        train_tf = str(resolve_train_transform_key(dataset_cfg))
+    else:
+        train_tf = train_transforms
 
     split_train_val = float(dataset_cfg.split_train_val)
-    splits = _build_splits(split_train_val)
+    splits = _build_splits(split_train_val, train_transforms=train_tf)
     device_t = torch.device(device)
 
     loaders = get_dataloaders(
@@ -340,7 +357,7 @@ def load(
     assert_batch_sane(batch_x, batch_y, dataset_name=dataset_cfg.name)
 
     num_channels, height, width = (int(d) for d in batch_x.shape[1:])
-    if dataset_cfg.name in _PADDED_SQUARE_EXPECTATIONS:
+    if pad_for_proxy and dataset_cfg.name in _PADDED_SQUARE_EXPECTATIONS:
         pad_side = _PADDED_SQUARE_EXPECTATIONS[dataset_cfg.name]
         assert (height, width) == (pad_side, pad_side), (
             f"{dataset_cfg.name}: expected padded square ({pad_side}, "
@@ -354,7 +371,8 @@ def load(
         "batch_shape": (num_channels, height, width),
         "split_train_val": split_train_val,
         "seed": seed,
-        "transforms": "standard",
+        "transforms": train_tf,
+        "pad_for_proxy": bool(pad_for_proxy),
         "in_channels": num_channels,
         "input_image_size": height,
         "image_shape": (num_channels, height, width),
