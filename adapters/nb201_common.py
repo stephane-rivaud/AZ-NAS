@@ -333,7 +333,8 @@ def wandb_run_kwargs(
     entity = os.environ.get("WANDB_ENTITY", DEFAULT_WANDB_ENTITY)
     project = os.environ.get("WANDB_PROJECT", DEFAULT_WANDB_PROJECT)
     mode = os.environ.get("WANDB_MODE", "online")
-    return {
+    group = os.environ.get("WANDB_RUN_GROUP") or os.environ.get("WANDB_GROUP")
+    kwargs: dict[str, Any] = {
         "entity": entity if entity and entity != DEFAULT_WANDB_ENTITY else None,
         "project": project,
         "name": run_name,
@@ -342,6 +343,9 @@ def wandb_run_kwargs(
         "mode": mode,
         "reinit": True,
     }
+    if group:
+        kwargs["group"] = group
+    return kwargs
 
 
 @contextlib.contextmanager
