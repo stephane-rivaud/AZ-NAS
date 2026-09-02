@@ -21,10 +21,12 @@ Locked contract (see ``.cursor/plans/az-nas_grow_adapters_0b7a938b.plan.md``):
   native ``(3, 60, 60)``. This is the AZ-NAS proxy geometry policy (see
   ``adapters/spaces/README.md``): AZ-NAS's ``compute_az_nas_score``
   trainability term relies on ``nn.PixelUnshuffle``, which needs even
-  stride-2 ratios. Full 200-ep train passes ``pad_for_proxy=False`` (native
-  shapes) and ``train_transforms="auto"`` (augmented when YAML defines it).
-  Native shapes on disk are unchanged; only the proxy/search-facing
-  transform pipeline pads them.
+  stride-2 ratios. Full 200-ep train usually passes ``pad_for_proxy=False``
+  (native shapes) and ``train_transforms="auto"`` (augmented when YAML
+  defines it). **Exception:** gutenberg train also pads → ``32x32`` (same as
+  search) because NB201 ``ResNetBasicblock`` stride-2 residuals disagree on
+  odd heights (Conv3×3 pad=1 → 14 vs AvgPool2d → 13 for H=27). Native shapes
+  on disk are unchanged; only the adapter-facing transform pipeline pads them.
 - The first training batch is asserted to be ``BCHW`` float with labels and
   no NaN/Inf before being handed back to the caller.
 """
@@ -299,7 +301,9 @@ def load(
     pad_for_proxy
         When True (default), apply AZ-NAS proxy geometry pads (multnist /
         gutenberg → 32, geoclassing → 64) for zero-cost scoring. When False,
-        keep **native** grow shapes for 200-ep train.
+        keep **native** grow shapes (200-ep train default). Callers that need
+        residual-safe train geometry for gutenberg pass True via
+        ``nb201_common.train_uses_score_pad``.
     train_transforms
         Transform key for the train split: ``"standard"`` (proxy/search),
         ``"augmented"`` (train when YAML defines it), or ``"auto"`` (use

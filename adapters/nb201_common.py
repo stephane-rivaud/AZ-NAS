@@ -51,7 +51,7 @@ P0_DATASETS = (
     "chesseract",
 )
 
-# Score-only pad expectations (train uses native shapes).
+# Score pad expectations (search always; train when ``train_uses_score_pad``).
 SCORE_PAD_EXPECTATIONS: dict[str, tuple[int, int, int]] = {
     "multnist": (3, 32, 32),
     "cifartile": (3, 64, 64),
@@ -59,6 +59,17 @@ SCORE_PAD_EXPECTATIONS: dict[str, tuple[int, int, int]] = {
     "gutenberg": (1, 32, 32),
     "chesseract": (12, 8, 8),  # board12 family; stem in_channels=12 later
 }
+
+# Datasets whose *native* H/W break NB201 ``ResNetBasicblock`` stride-2 residuals
+# (Conv3×3 pad=1 → ceil-ish vs AvgPool2d pad=0 → floor on odd sides). Gutenberg
+# native ``(1, 27, 18)`` yields 14 vs 13 on dim 2 at the first reduction. Align
+# train to the same score pad (32×32) as search — do not rerank.
+TRAIN_SCORE_PAD_DATASETS: frozenset[str] = frozenset({"gutenberg"})
+
+
+def train_uses_score_pad(dataset: str) -> bool:
+    """Whether 200-ep train should apply the search score pad for ``dataset``."""
+    return dataset in TRAIN_SCORE_PAD_DATASETS
 
 
 def resolve_az_nas_root() -> Path:

@@ -127,6 +127,32 @@ def test_train_cli_help() -> None:
     assert "sgd_nesterov" in proc.stdout or "200" in proc.stdout
 
 
+def test_train_uses_score_pad_gutenberg_only() -> None:
+    assert nb.train_uses_score_pad("gutenberg") is True
+    for ds in ("multnist", "cifartile", "geoclassing", "chesseract"):
+        assert nb.train_uses_score_pad(ds) is False
+
+
+@pytest.mark.skipif(
+    not (ADAPTERS.parent / "NB201" / "xautodl").is_dir(),
+    reason="NB201 tree missing",
+)
+def test_tiny_network_gutenberg_native_vs_padded() -> None:
+    """Native 27×18 crashes residual add; search pad 32×32 forwards cleanly."""
+    torch = pytest.importorskip("torch")
+    with nb.nb201_context(ADAPTERS.parent):
+        g = nb.parse_genotype(
+            "|nor_conv_3x3~0|+|nor_conv_3x3~0|nor_conv_3x3~1|"
+            "+|skip_connect~0|nor_conv_1x1~1|nor_conv_3x3~2|"
+        )
+        net = nb.build_tiny_network(g, num_classes=6, in_channels=1, C=4, N=1)
+        with pytest.raises(RuntimeError, match="size of tensor"):
+            net(torch.randn(2, 1, 27, 18))
+        feat, logits = net(torch.randn(2, 1, 32, 32))
+        assert logits.shape == (2, 6)
+        assert feat.ndim == 2
+
+
 @pytest.mark.skipif(
     not (ADAPTERS.parent / "NB201" / "xautodl").is_dir(),
     reason="NB201 tree missing",

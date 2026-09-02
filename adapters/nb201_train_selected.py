@@ -3,8 +3,10 @@
 
 Locked recipe: ``sgd_nesterov`` (lr=0.1, momentum=0.9, nesterov) +
 ``linear5warmup_cosine195``, ``nb_step=200``. CE on **logits** (forward returns
-``features, logits``). Native grow shapes (no score pad); augmented train
-loaders where the dataset YAML defines ``transforms.augmented``.
+``features, logits``). Native grow shapes by default; datasets in
+``nb201_common.TRAIN_SCORE_PAD_DATASETS`` (gutenberg) reuse the search score
+pad so residual reductions stay even. Augmented train loaders where the
+dataset YAML defines ``transforms.augmented``.
 
 Run inside grow's ``uv`` env (needs ``gromo`` for P0 datasets) with NB201 on
 ``sys.path`` via this script's context:
@@ -324,7 +326,10 @@ def train_one_job(
 
     _gate_download(args.dataset_config, grow_root, args.allow_download)
 
-    # Native shapes + augmented train where YAML defines it.
+    # Native shapes by default; gutenberg (and any TRAIN_SCORE_PAD_DATASETS)
+    # reuse search pad so ResNetBasicblock stride-2 residuals match.
+    # Augmented train where YAML defines it.
+    pad_for_proxy = nb.train_uses_score_pad(args.dataset_config)
     train_loader, meta = grow_data.load(
         args.dataset_config,
         batch_size=args.batch_size,
@@ -332,7 +337,7 @@ def train_one_job(
         num_workers=args.num_workers,
         device=device,
         grow_root=grow_root,
-        pad_for_proxy=False,
+        pad_for_proxy=pad_for_proxy,
         train_transforms="auto",
         download=True if args.allow_download else None,
     )
@@ -573,7 +578,7 @@ def train_one_job(
                 "batch_shape": list(batch_shape),
                 "num_classes": num_classes,
                 "in_channels": in_channels,
-                "pad_for_proxy": False,
+                "pad_for_proxy": pad_for_proxy,
                 "transforms": meta.get("transforms"),
                 "epochs": epochs,
                 "optimizer": "sgd_nesterov",
